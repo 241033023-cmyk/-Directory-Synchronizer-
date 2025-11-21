@@ -1,0 +1,154 @@
+#!/usr/bin/env bash
+set -euo pipefail
+IFS=$'\n\t'
+
+# Directory Synchronizer for macOS (BSD tools)
+# Copies missing or newer files from SRC -> DST (unidirectional)
+# Supports: --dry-run, --log FILE, --exclude PATTERN (multiple)
+
+usage() {
+  cat <<EOF
+Usage: $0 [OPTIONS] SRC_DIR DST_DIR
+
+Options:
+  --dry-run           : show actions but don't actually copy
+  --log FILE          : append actions to FILE
+  --exclude PATTERN   : exclude files/dirs matching PATTERN (can be used multiple times)
+  --help              : show help
+EOF
+  exit 1
+}
+
+DRY_RUN=0
+LOGFILE=""
+EXCLUDES=()
+
+# Parse options (simple)
+while [[ ${#} -gt 0 ]]; do
+  case "$1" in
+    --dry-run) DRY_RUN=1; shift ;;
+    --log) LOGFILE="$2"; shift 2 ;;
+    --exclude) EXCLUDES+=("$2"); shift 2 ;;
+    --help) usage ;;
+    --*) echo "Unknown option: $1" >&2; usage ;;
+    *) 
+      if [[ -z "${SRC-}" ]]; then
+        SRC="$1"
+      elif [[ -z "${DST-}" ]]; then
+        DST="$1"
+      else
+        echo "Extra argument: $1" >&2; usage
+      fi
+      shift
+      ;;
+  esac
+done
+
+if [[ -z "${SRC-}" || -z "${DST-}" ]]; then
+  usage
+fi
+
+if [[ ! -d "$SRC" ]]; then
+  echo "Source directory does not exist: $SRC" >&2
+  exit 2
+fi
+
+if [[ ! -e "$DST" ]]; then
+  if [[ $DRY_RUN -eq 1 ]]; then
+    echo "[DRY RUN] Would create destination directory: $DST"
+  else
+    mkdir -p -- "$DST"
+    echo "Created destination directory: $DST"
+  fi
+fi
+
+log() {
+  local msg="$*"
+  echo "$msg"
+  if [[ -n "$LOGFILE" ]]; then
+    printf '%s\n' "$(date -u +"%Y-%m-%dT%H:%M:%SZ") - $msg" >> "$LOGFILE"
+  fi
+}
+
+is_excluded() {
+  local path="$1"
+  for pat in "${EXCLUDES[@]}"; do
+    # Test against basename and path patterns
+    if [[ "${path##/}" == $pat || "$path" == $pat || "$path" == */$pat || "$path" == $pat/ ]]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+# On macOS, use stat -f %m to get mtime (seconds since epoch)
+# Use find to walk files; produce NUL-separated output for safety
+cd "$SRC"
+
+while IFS= read -r -d $'\0' srcpath; do
+  [[ "$srcpath" == "." ]] && continue
+  relpath="${srcpath#./}"
+
+  if is_excluded "$relpath"; then
+    log "Skipping excluded: $relpath"
+    continue
+  fi
+
+  srcfull="$SRC/$relpath"
+  dstfull="$DST/$relpath"
+
+  if [[ -d "$srcfull" && ! -L "$srcfull" ]]; then
+    if [[ ! -d "$dstfull" ]]; then
+      if [[ $DRY_RUN -eq 1 ]]; then
+        log "[DRY RUN] Would create directory: $dstfull"
+      else
+        mkdir -p -- "$dstfull"
+        # try to preserve permissions; ignore errors
+        chmod --reference="$srcfull" "$dstfull" 2>/dev/null || true
+        log "Created directory: $dstfull"
+      fi
+    fi
+    continue
+  fi
+
+  # File or symlink
+  copy_it=0
+
+  if [[ ! -e "$dstfull" && ! -L "$dstfull" ]]; then
+    copy_it=1
+    reason="missing in destination"
+  else
+    # Get modification times (macOS stat)
+    src_mtime=$(stat -f %m -- "$srcfull" 2>/dev/null || echo 0)
+    dst_mtime=$(stat -f %m -- "$dstfull" 2>/dev/null || echo 0)
+    if [[ "$src_mtime" -gt "$dst_mtime" ]]; then
+      copy_it=1
+      reason="source is newer"
+    fi
+  fi
+
+  if [[ $copy_it -eq 1 ]]; then
+    if [[ $DRY_RUN -eq 1 ]]; then
+      log "[DRY RUN] Would copy ($reason): $relpath"
+    else
+      mkdir -p -- "$(dirname "$dstfull")"
+      if [[ -L "$srcfull" ]]; then
+        # Recreate symlink target as-is
+        if [[ -e "$dstfull" || -L "$dstfull" ]]; then
+          rm -f -- "$dstfull"
+        fi
+        link_target=$(readlink "$srcfull")
+        ln -s -- "$link_target" "$dstfull"
+        log "Copied symlink: $relpath -> $link_target"
+      else
+        cp -p -- "$srcfull" "$dstfull"
+        log "Copied file: $relpath ($reason)"
+      fi
+    fi
+  fi
+
+done < <(find . -mindepth 1 -print0)
+
+log "Sync complete: $SRC -> $DST"
+exit 0
+
